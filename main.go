@@ -47,6 +47,7 @@ var userAgent = version.Name + "/" + version.Version + " (" + version.OSArch + "
 
 var (
 	flagHost             = flag.String("host", "", "Cloud Run host for which to proxy")
+	flagResolve          = flag.String("resolve", "", "override Cloud Run Host IP address")
 	flagBind             = flag.String("bind", "127.0.0.1:8080", "local host:port on which to listen")
 	flagAudience         = flag.String("audience", "", "override JWT audience value (aud)")
 	flagToken            = flag.String("token", "", "override OIDC token")
@@ -98,6 +99,11 @@ func realMain(ctx context.Context) error {
 		return fmt.Errorf("failed to parse host URL: %w", err)
 	}
 
+	resolve := *flagResolve
+	if resolve != "" && net.ParseIP(resolve) == nil {
+		return fmt.Errorf("failed to parse host resolve ip address")
+	}
+
 	// Compute the audience, default to the host. However, there might be cases
 	// where you want to specify a custom aud (such as when accessing through a
 	// load balancer).
@@ -124,7 +130,7 @@ func realMain(ctx context.Context) error {
 	}
 
 	// Construct the proxy.
-	proxy := buildProxy(host, bind, tokenSource)
+	proxy := buildProxy(host, bind, resolve, tokenSource)
 
 	// Create server.
 	server := &http.Server{
@@ -173,7 +179,7 @@ func realMain(ctx context.Context) error {
 
 // buildProxy builds the reverse proxy server, forwarding requests on bind to
 // the provided host.
-func buildProxy(host, bind *url.URL, tokenSource oauth2.TokenSource) *httputil.ReverseProxy {
+func buildProxy(host, bind *url.URL, resolve string, tokenSource oauth2.TokenSource) *httputil.ReverseProxy {
 	// Build and configure the proxy.
 	proxy := httputil.NewSingleHostReverseProxy(host)
 
@@ -246,6 +252,28 @@ func buildProxy(host, bind *url.URL, tokenSource oauth2.TokenSource) *httputil.R
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	if resolve != "" {
+		// Configure dialer with settings matching the dialer in http.DefaultTransport
+		proxyDialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+
+		// Configure transport with settings matching http.DefaultTransport
+		proxy.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				addr = resolve + addr[strings.LastIndex(addr, ":"):]
+				return proxyDialer.DialContext(ctx, network, addr)
+			},
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
 	}
 
 	return proxy
